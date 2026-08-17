@@ -7,12 +7,28 @@ source files on the fly.
 """
 import argparse
 import random
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 DEFAULT_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".ts"}
+
+DURATION_RE = re.compile(
+    r"^(?:(?P<hours>\d+\.?\d*)h)?(?:(?P<minutes>\d+\.?\d*)m)?(?:(?P<seconds>\d+\.?\d*)s?)?$"
+)
+
+
+def parse_duration(text: str) -> float:
+    """Parse '2h', '90m', '5400', '5400s', '1h30m' into seconds."""
+    match = DURATION_RE.match(text.strip())
+    if not match or not any(match.groups()):
+        raise argparse.ArgumentTypeError(f"invalid duration: {text!r}")
+    hours = float(match.group("hours") or 0)
+    minutes = float(match.group("minutes") or 0)
+    seconds = float(match.group("seconds") or 0)
+    return hours * 3600 + minutes * 60 + seconds
 
 
 def find_videos(root: Path, extensions: set[str], recursive: bool) -> list[Path]:
@@ -73,6 +89,27 @@ def edl_field(text: str) -> str:
     return f"%{len(encoded)}%{text}"
 
 
+def trim_to_target(
+    segments: list[tuple[Path, float, float]], target: float
+) -> list[tuple[Path, float, float]]:
+    """Keep segments (in order) until their total length reaches target,
+    trimming the final one to land on it exactly."""
+    trimmed: list[tuple[Path, float, float]] = []
+    total = 0.0
+    for path, start, length in segments:
+        if total + length >= target:
+            trimmed.append((path, start, target - total))
+            return trimmed
+        trimmed.append((path, start, length))
+        total += length
+    print(
+        f"warning: only {total:.1f}s of footage available, short of the "
+        f"{target:.1f}s target",
+        file=sys.stderr,
+    )
+    return trimmed
+
+
 def write_edl(segments: list[tuple[Path, float, float]], output: Path) -> None:
     lines = ["# mpv EDL v0"]
     for path, start, length in segments:
@@ -87,8 +124,16 @@ def main() -> int:
     parser.add_argument("--min-len", type=float, default=15.0, help="Minimum segment length in seconds")
     parser.add_argument("--max-len", type=float, default=45.0, help="Maximum segment length in seconds")
     parser.add_argument(
+        "--seg-len", type=float, default=None,
+        help="Use one fixed segment length instead of randomizing between --min-len/--max-len",
+    )
+    parser.add_argument(
         "--min-tail", type=float, default=5.0,
         help="Leftover shorter than this gets merged into the previous segment instead of dropped",
+    )
+    parser.add_argument(
+        "--target-duration", type=parse_duration, default=None,
+        help="Cap the final playlist length, e.g. '2h', '90m', '5400s'. Trims the last segment to land on it exactly.",
     )
     parser.add_argument("--ext", nargs="+", default=None, help="Extra file extensions to include (e.g. .flv)")
     parser.add_argument("--no-recursive", action="store_true", help="Don't scan subdirectories")
@@ -96,7 +141,11 @@ def main() -> int:
     parser.add_argument("--play", action="store_true", help="Launch mpv on the generated playlist")
     args = parser.parse_args()
 
-    if args.min_len <= 0 or args.max_len < args.min_len:
+    if args.seg_len is not None:
+        if args.seg_len <= 0:
+            parser.error("--seg-len must be positive")
+        args.min_len = args.max_len = args.seg_len
+    elif args.min_len <= 0 or args.max_len < args.min_len:
         parser.error("require 0 < min-len <= max-len")
 
     if shutil.which("ffprobe") is None:
@@ -131,6 +180,8 @@ def main() -> int:
         return 1
 
     random.shuffle(all_segments)
+    if args.target_duration is not None:
+        all_segments = trim_to_target(all_segments, args.target_duration)
     write_edl(all_segments, args.output)
 
     total_hours = sum(length for _, _, length in all_segments) / 3600
